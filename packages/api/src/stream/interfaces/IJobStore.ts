@@ -75,6 +75,9 @@ export interface SerializableJobData {
   /** Response message ID for reconnection */
   responseMessageId?: string;
 
+  /** Exact assistant-message fields authored by the user during this running job. */
+  userSubmittedPaths?: string[];
+
   /**
    * Whether this run has activity labels enabled (per-endpoint
    * `activityLabel: true`). Set once at run start so the resume path can

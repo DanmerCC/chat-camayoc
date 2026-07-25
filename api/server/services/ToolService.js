@@ -32,6 +32,7 @@ const {
   assertModelBoundContent,
   extractToolArgumentContent,
   contentFilterBlockResponse,
+  getSafeErrorMetadata,
   isFileAuthoringToolDefinition,
   ASK_USER_QUESTION_TOOL_NAME,
   splitMCPToolKey,
@@ -168,6 +169,28 @@ const prepareStoredActionsForUse = async ({ actions, filters, decrypt }) => {
     assertModelBoundContent({ filters, actions: decryptedActions });
   }
   return decryptedActions;
+};
+
+/**
+ * Loads and inspects the persisted action snapshot before any unrelated tool
+ * initialization can connect to MCP, emit OAuth state, prime provider files,
+ * or create generic tool instances. The caller reuses the returned snapshot
+ * for the rest of the request, avoiding a second read and TOCTOU drift.
+ */
+const prepareActionSnapshotForTools = async ({ agentId, toolNames, filters, decrypt }) => {
+  if (!toolNames.some((toolName) => isActionTool(toolName))) {
+    return null;
+  }
+  const storedActions = (await loadActionSets({ agent_id: agentId })) ?? [];
+  if (storedActions.length === 0) {
+    return { storedActions, actionSets: [] };
+  }
+  const actionSets = await prepareStoredActionsForUse({
+    actions: storedActions,
+    filters,
+    decrypt,
+  });
+  return { storedActions, actionSets };
 };
 
 /**
@@ -794,6 +817,12 @@ async function loadToolDefinitionsWrapper({
     toolResources: tool_resources,
     tools: filteredTools,
   });
+  const preparedActionSnapshot = await prepareActionSnapshotForTools({
+    agentId: agent.id,
+    toolNames: filteredTools,
+    filters: req.config?.filters,
+    decrypt: false,
+  });
 
   /** Only MCP tool keys need the server context; a purely non-MCP agent should not
    *  pay an app-config lookup on startup. */
@@ -1097,15 +1126,13 @@ async function loadToolDefinitionsWrapper({
   };
 
   const getActionToolDefinitions = async (agentId, actionToolNames) => {
-    const storedActions = (await loadActionSets({ agent_id: agentId })) ?? [];
-    if (storedActions.length === 0) {
+    if (agentId !== agent.id || preparedActionSnapshot == null) {
       return [];
     }
-    const actionSets = await prepareStoredActionsForUse({
-      actions: storedActions,
-      filters: req.config?.filters,
-      decrypt: false,
-    });
+    const { actionSets } = preparedActionSnapshot;
+    if (actionSets.length === 0) {
+      return [];
+    }
 
     const definitions = [];
     const allowedDomains = appConfig?.actions?.allowedDomains;
@@ -1324,7 +1351,10 @@ async function loadToolDefinitionsWrapper({
       if (isFatalAgentInitializationError(error)) {
         throw error;
       }
-      logger.error('[loadToolDefinitionsWrapper] Error priming code files:', error);
+      logger.error(
+        '[loadToolDefinitionsWrapper] Error priming code files:',
+        getSafeErrorMetadata(error),
+      );
     }
   }
 
@@ -1340,7 +1370,10 @@ async function loadToolDefinitionsWrapper({
         dynamicToolContextMap[Tools.file_search] = toolContext;
       }
     } catch (error) {
-      logger.error('[loadToolDefinitionsWrapper] Error priming search files:', error);
+      logger.error(
+        '[loadToolDefinitionsWrapper] Error priming search files:',
+        getSafeErrorMetadata(error),
+      );
     }
   }
 
@@ -1502,6 +1535,12 @@ async function loadAgentTools({
     toolResources: tool_resources,
     tools: _agentTools,
   });
+  const preparedActionSnapshot = await prepareActionSnapshotForTools({
+    agentId: agent.id,
+    toolNames: _agentTools,
+    filters: req.config?.filters,
+    decrypt: true,
+  });
   /** @type {ReturnType<typeof createOnSearchResults>} */
   let webSearchCallbacks;
   if (includesWebSearch) {
@@ -1638,8 +1677,7 @@ async function loadAgentTools({
 
   agentTools.push(...additionalTools);
 
-  const hasActionTools = _agentTools.some((t) => isActionTool(t));
-  if (!hasActionTools) {
+  if (preparedActionSnapshot == null) {
     return {
       toolRegistry,
       requestScopedConnections: getMCPRequestContext(req, res),
@@ -1654,7 +1692,7 @@ async function loadAgentTools({
     };
   }
 
-  const storedActions = (await loadActionSets({ agent_id: agent.id })) ?? [];
+  const { storedActions, actionSets } = preparedActionSnapshot;
   if (storedActions.length === 0) {
     if (_agentTools.length > 0 && agentTools.length === 0) {
       logger.warn(`No tools found for ${_agentTools.length} specified tool call(s)`);
@@ -1672,12 +1710,6 @@ async function loadAgentTools({
       primedCodeFiles,
     };
   }
-  const actionSets = await prepareStoredActionsForUse({
-    actions: storedActions,
-    filters: req.config?.filters,
-    decrypt: true,
-  });
-
   // See registerActionTools for the key-shape rationale.
   const toolToAction = new Map();
 
@@ -1920,6 +1952,23 @@ async function loadToolsForExecution({
     isPTCRequested &&
     enabledCapabilities.has(AgentCapabilities.programmatic_tools) &&
     codeExecutionEnabled;
+  const requestedActionToolNames = toolNames.filter((name) => isActionTool(name));
+  const orchestratedActionToolNames =
+    isPTC && toolRegistry
+      ? Array.from(toolRegistry.keys()).filter((name) => isActionTool(name))
+      : [];
+  const preflightActionToolNames = [
+    ...new Set([...requestedActionToolNames, ...orchestratedActionToolNames]),
+  ];
+  const preparedActionSnapshot =
+    agent && actionsEnabled
+      ? await prepareActionSnapshotForTools({
+          agentId: agent.id,
+          toolNames: preflightActionToolNames,
+          filters: req.config?.filters,
+          decrypt: true,
+        })
+      : null;
 
   logger.debug(
     `[loadToolsForExecution] isToolSearch: ${isToolSearch}, toolRegistry: ${toolRegistry?.size ?? 'undefined'}`,
@@ -1952,7 +2001,7 @@ async function loadToolsForExecution({
         allLoadedTools.push(ptcTool);
       }
     } catch (error) {
-      logger.error('[loadToolsForExecution] Error creating PTC tool:', error);
+      logger.error('[loadToolsForExecution] Error creating PTC tool:', getSafeErrorMetadata(error));
     }
   }
 
@@ -1974,7 +2023,10 @@ async function loadToolsForExecution({
       });
       allLoadedTools.push(bashTool);
     } catch (error) {
-      logger.error('[loadToolsForExecution] Failed to create bash_tool', error);
+      logger.error(
+        '[loadToolsForExecution] Failed to create bash_tool',
+        getSafeErrorMetadata(error),
+      );
     }
   }
 
@@ -2075,6 +2127,7 @@ async function loadToolsForExecution({
       streamId,
       jobCreatedAt,
       actionToolNames,
+      preparedActionSnapshot,
     });
     allLoadedTools.push(...actionTools);
   } else if (actionToolNames.length > 0 && agent && !actionsEnabled) {
@@ -2114,6 +2167,7 @@ async function loadToolsForExecution({
  * @param {string|null} params.streamId - Stream ID
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted tool events
  * @param {string[]} params.actionToolNames - Action tool names to load
+ * @param {{storedActions: Array, actionSets: Array}} params.preparedActionSnapshot - Pre-inspected action snapshot
  * @returns {Promise<Array>} Loaded action tools
  */
 async function loadActionToolsForExecution({
@@ -2124,18 +2178,17 @@ async function loadActionToolsForExecution({
   streamId,
   jobCreatedAt,
   actionToolNames,
+  preparedActionSnapshot,
 }) {
   const loadedActionTools = [];
 
-  const storedActions = (await loadActionSets({ agent_id: agent.id })) ?? [];
+  const { storedActions, actionSets } = preparedActionSnapshot ?? {
+    storedActions: [],
+    actionSets: [],
+  };
   if (storedActions.length === 0) {
     return loadedActionTools;
   }
-  const actionSets = await prepareStoredActionsForUse({
-    actions: storedActions,
-    filters: req.config?.filters,
-    decrypt: true,
-  });
 
   // See registerActionTools for the key-shape rationale.
   const toolToAction = new Map();

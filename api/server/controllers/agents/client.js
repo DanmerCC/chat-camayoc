@@ -106,6 +106,11 @@ const {
   extractStoredMessageContent,
   inspectContent,
   ContentFilterError,
+  ContentTraversalLimitError,
+  collectReachableAgents,
+  getDynamicToolContexts,
+  getResumeContentInspection,
+  getSafeErrorMetadata,
 } = require('@librechat/api');
 const {
   Run,
@@ -242,6 +247,14 @@ function assertResumeToolContentAllowed(filters, messages, seedContent) {
   if (finding != null) {
     throw new ContentFilterError(finding);
   }
+}
+
+function getUserFacingRequestError(baseMessage, error, appConfig) {
+  const protectionEnabled = appConfig?.filters != null || appConfig?.messageFilter?.pii != null;
+  if (protectionEnabled || !error?.message) {
+    return baseMessage;
+  }
+  return `${baseMessage}: ${error.message}`;
 }
 
 class AgentClient extends BaseClient {
@@ -392,7 +405,8 @@ class AgentClient extends BaseClient {
         }
       } catch (err) {
         logger.warn(
-          `[AgentClient] Failed to attach subagent content for tool_call ${toolCall.id}: ${err?.message ?? err}`,
+          `[AgentClient] Failed to attach subagent content for tool_call ${toolCall.id}`,
+          getSafeErrorMetadata(err),
         );
       }
     }
@@ -1451,7 +1465,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #getSaveOptions] Error parsing options',
-        error,
+        getSafeErrorMetadata(error),
       );
     }
 
@@ -1526,16 +1540,30 @@ class AgentClient extends BaseClient {
       return agent;
     };
 
-    /** Collect all agents for unified processing while preserving stable/dynamic instruction fields. */
-    const allAgents = [
-      { agent: normalizeInstructions(this.options.agent), agentId: this.options.agent.id },
-      ...(this.agentConfigs?.size > 0
-        ? Array.from(this.agentConfigs.entries()).map(([agentId, agent]) => ({
-            agent: normalizeInstructions(agent),
-            agentId,
-          }))
-        : []),
+    /** Collect every reachable agent once, including nested pure subagents. */
+    const rootAgents = [
+      this.options.agent,
+      ...(this.agentConfigs?.size > 0 ? this.agentConfigs.values() : []),
     ];
+    const allAgents = collectReachableAgents(rootAgents).map((agent) => ({
+      agent: normalizeInstructions(agent),
+      agentId: agent.id,
+    }));
+    const dynamicToolContexts = getDynamicToolContexts(allAgents.map(({ agent }) => agent));
+    for (const context of dynamicToolContexts) {
+      modelBoundFileContexts.add(context);
+    }
+    for (const { agent } of allAgents) {
+      for (const attachment of [
+        ...(agent.attachments ?? []),
+        ...(agent.requestAttachments ?? []),
+        ...(agent.agentContextAttachments ?? []),
+      ]) {
+        if (attachment) {
+          modelBoundFileContexts.add(attachment);
+        }
+      }
+    }
     /**
      * Memory authorization/loading and MCP config resolution do not depend on
      * attachment hydration or prompt formatting. Start them before that work,
@@ -1550,12 +1578,16 @@ class AgentClient extends BaseClient {
       resolveConfigServers(this.options.req),
     ]);
     void earlySharedContextPromise.catch(() => {});
-
     assertModelBoundContent({
       filters: this.options.req.config?.filters,
       legacyPii: this.options.req.config?.messageFilter?.pii,
-      storedMessages: orderedMessages,
+      storedMessages: this.getModelBoundStoredMessages(orderedMessages),
       agents: allAgents.map(({ agent }) => agent),
+      files: [...modelBoundFileContexts],
+      resolvedFiles:
+        this.options.resendFiles === false
+          ? []
+          : Array.from(this.authorizedHistoricalFiles?.values?.() ?? []),
     });
     const sharedRunAttachmentIds = new Set();
     /** @type {ReturnType<typeof buildAgentScopedContext>} */
@@ -1870,35 +1902,27 @@ class AgentClient extends BaseClient {
           getFormattedMemories: db.getFormattedMemories,
         });
       } catch (error) {
-        logger.error('[AgentClient] Error loading partition memories', error);
+        logger.error('[AgentClient] Error loading partition memories', getSafeErrorMetadata(error));
         return undefined;
       }
     };
     const canonicalMemoryCache = new Map();
     const getCanonicalAgentMemories = async (agent) => {
-      if (
-        this.options.req.config?.filters?.memories?.pii == null ||
-        typeof db.getUserMemories !== 'function'
-      ) {
+      if (this.options.req.config?.filters?.memories?.pii == null) {
         return undefined;
+      }
+      if (typeof db.getUserMemories !== 'function') {
+        throw new Error('Canonical memory inspection is unavailable');
       }
       const agentId = getMemoryAgentId(agent);
       const cacheKey = agentId ?? '__shared__';
       if (!canonicalMemoryCache.has(cacheKey)) {
         canonicalMemoryCache.set(
           cacheKey,
-          db
-            .getUserMemories({
-              userId: this.options.req.user.id + '',
-              agentId,
-            })
-            .catch((error) => {
-              logger.error('[AgentClient] Error loading memories for content inspection', {
-                name: error?.name,
-                code: error?.code,
-              });
-              return undefined;
-            }),
+          db.getUserMemories({
+            userId: this.options.req.user.id + '',
+            agentId,
+          }),
         );
       }
       return canonicalMemoryCache.get(cacheKey);
@@ -1907,11 +1931,22 @@ class AgentClient extends BaseClient {
     const sharedRunContext = sharedRunContextParts.join('\n\n');
     const memoryAgentEnabled = isMemoryAgentEnabled(this.options.req.config?.memory);
 
-    const contextAttachments = this.options.agentContextAttachmentsByAgentId;
+    const configuredContextAttachments = this.options.agentContextAttachmentsByAgentId;
+    const contextAttachments =
+      configuredContextAttachments instanceof Map
+        ? new Map(configuredContextAttachments)
+        : new Map(Object.entries(configuredContextAttachments ?? {}));
+    for (const { agent, agentId } of allAgents) {
+      if (
+        !contextAttachments.has(agentId) &&
+        Array.isArray(agent.agentContextAttachments) &&
+        agent.agentContextAttachments.length > 0
+      ) {
+        contextAttachments.set(agentId, agent.agentContextAttachments);
+      }
+    }
     const attachmentLists =
-      contextAttachments instanceof Map
-        ? [...contextAttachments.values()]
-        : Object.values(contextAttachments ?? {});
+      contextAttachments instanceof Map ? [...contextAttachments.values()] : [];
     for (const attachments of attachmentLists) {
       for (const attachment of attachments ?? []) {
         if (attachment) {
@@ -2030,7 +2065,7 @@ class AgentClient extends BaseClient {
       if (error.message === 'Memory processing timeout') {
         logger.warn('[AgentClient] Memory processing timed out after 3 seconds');
       } else {
-        logger.error('[AgentClient] Error processing memory:', error);
+        logger.error('[AgentClient] Error processing memory:', getSafeErrorMetadata(error));
       }
       return;
     }
@@ -2080,7 +2115,7 @@ class AgentClient extends BaseClient {
       } catch (error) {
         logger.error(
           '[api/server/controllers/agents/client.js #useMemory] Error loading memories',
-          error,
+          getSafeErrorMetadata(error),
         );
         return;
       }
@@ -2110,7 +2145,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #useMemory] Error loading agent for memory',
-        error,
+        getSafeErrorMetadata(error),
       );
     }
 
@@ -2191,6 +2226,7 @@ class AgentClient extends BaseClient {
       memoryMethods: {
         setMemory: db.setMemory,
         deleteMemory: db.deleteMemory,
+        getUserMemories: db.getUserMemories,
         getFormattedMemories: db.getFormattedMemories,
       },
       res: this.options.res,
@@ -2209,7 +2245,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #useMemory] Error loading keyed memories',
-        error,
+        getSafeErrorMetadata(error),
       );
     }
     return { withKeys, withoutKeys };
@@ -2327,7 +2363,7 @@ class AgentClient extends BaseClient {
       const bufferMessage = new HumanMessage(limitedMemoryInput);
       return await this.processMemory([bufferMessage]);
     } catch (error) {
-      logger.error('Memory Agent failed to process memory', error);
+      logger.error('Memory Agent failed to process memory', getSafeErrorMetadata(error));
     }
   }
 
@@ -2587,7 +2623,7 @@ class AgentClient extends BaseClient {
             sendEvent(res, { event: UsageEvents.ON_TOKEN_USAGE, data });
           }
         } catch (err) {
-          logger.warn('[AgentClient] Failed to emit subagent usage', err);
+          logger.warn('[AgentClient] Failed to emit subagent usage', getSafeErrorMetadata(err));
         }
       })();
       this.pendingSubagentEmits.push(emit);
@@ -2876,7 +2912,7 @@ class AgentClient extends BaseClient {
     } catch (err) {
       logger.warn(
         `[AgentClient] Failed to capture discovered tools for resume on ${streamId}`,
-        err?.message ?? err,
+        getSafeErrorMetadata(err),
       );
     }
 
@@ -2907,7 +2943,10 @@ class AgentClient extends BaseClient {
         await decrementPendingRequest(this.options.req?.user?.id);
         this.pendingRequestReleased = true;
       } catch (err) {
-        logger.error(`[AgentClient] Failed to release request slot on pause ${streamId}`, err);
+        logger.error(
+          `[AgentClient] Failed to release request slot on pause ${streamId}`,
+          getSafeErrorMetadata(err),
+        );
       }
     }
     await GenerationJobManager.emitChunk(
@@ -3094,7 +3133,10 @@ class AgentClient extends BaseClient {
       assertModelBoundContent({
         filters: appConfig?.filters,
         legacyPii: appConfig?.messageFilter?.pii,
-        agents: [this.options.agent, ...(this.agentConfigs?.values() ?? [])],
+        agents: collectReachableAgents([
+          this.options.agent,
+          ...(this.agentConfigs?.values() ?? []),
+        ]),
         skills: [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])],
         memories: this.modelBoundMemoryContexts,
         files: this.modelBoundFileContexts,
@@ -3415,12 +3457,12 @@ class AgentClient extends BaseClient {
       if (abortController.signal.aborted) {
         logger.debug(
           '[api/server/controllers/agents/client.js #sendCompletion] Operation aborted by user',
-          { conversationId: this.conversationId, name: err?.name, code: err?.code },
+          { conversationId: this.conversationId, ...getSafeErrorMetadata(err) },
         );
       } else {
         logger.error(
           '[api/server/controllers/agents/client.js #sendCompletion] Unhandled error type',
-          err,
+          getSafeErrorMetadata(err),
         );
         const videoError = resolveGoogleVideoError({
           error: err,
@@ -3431,7 +3473,11 @@ class AgentClient extends BaseClient {
           type: ContentTypes.ERROR,
           [ContentTypes.ERROR]:
             videoError ??
-            `An error occurred while processing the request${err?.message ? `: ${err.message}` : ''}`,
+            getUserFacingRequestError(
+              'An error occurred while processing the request',
+              err,
+              this.options.req.config,
+            ),
         });
       }
     } finally {
@@ -3481,7 +3527,7 @@ class AgentClient extends BaseClient {
       } catch (err) {
         logger.error(
           '[api/server/controllers/agents/client.js #chatCompletion] Error in cleanup phase',
-          err,
+          getSafeErrorMetadata(err),
         );
       }
       if (this._resolveRun) {
@@ -3588,14 +3634,19 @@ class AgentClient extends BaseClient {
       }
 
       const tokenCounter = createTokenCounter(this.getEncoding());
-      const agents = [this.options.agent];
-      if (this.agentConfigs && this.agentConfigs.size > 0) {
-        agents.push(...this.agentConfigs.values());
+      const agents = collectReachableAgents([
+        this.options.agent,
+        ...(this.agentConfigs?.size > 0 ? this.agentConfigs.values() : []),
+      ]);
+      const dynamicToolContexts = getDynamicToolContexts(agents);
+      let checkpointMessages = [];
+      if (appConfig?.filters != null || appConfig?.messageFilter?.pii != null) {
+        try {
+          checkpointMessages = await getResumeCheckpointMessages(appConfig, this.conversationId);
+        } catch {
+          throw new ContentTraversalLimitError();
+        }
       }
-      const checkpointMessages =
-        appConfig?.filters != null || appConfig?.messageFilter?.pii != null
-          ? await getResumeCheckpointMessages(appConfig, this.conversationId)
-          : [];
       const checkpointUserMessages = [];
       const checkpointSkills = [];
       for (const message of checkpointMessages) {
@@ -3612,14 +3663,55 @@ class AgentClient extends BaseClient {
           });
         }
       }
+      const liveFiles = Array.isArray(this.options.attachments)
+        ? [...this.options.attachments]
+        : [];
+      const modelBoundAgentFiles = [];
+      const contextAttachmentLists =
+        this.options.agentContextAttachmentsByAgentId instanceof Map
+          ? this.options.agentContextAttachmentsByAgentId.values()
+          : Object.values(this.options.agentContextAttachmentsByAgentId ?? {});
+      for (const attachments of contextAttachmentLists) {
+        if (Array.isArray(attachments)) {
+          liveFiles.push(...attachments);
+          modelBoundAgentFiles.push(...attachments);
+        }
+      }
+      for (const agent of agents) {
+        if (Array.isArray(agent?.attachments)) {
+          liveFiles.push(...agent.attachments);
+          modelBoundAgentFiles.push(...agent.attachments);
+        }
+        if (Array.isArray(agent?.requestAttachments)) {
+          liveFiles.push(...agent.requestAttachments);
+          modelBoundAgentFiles.push(...agent.requestAttachments);
+        }
+        if (Array.isArray(agent?.agentContextAttachments)) {
+          liveFiles.push(...agent.agentContextAttachments);
+          modelBoundAgentFiles.push(...agent.agentContextAttachments);
+        }
+      }
+      const fileInspection = await getResumeContentInspection({
+        appConfig,
+        conversationId: this.conversationId,
+        targetMessageId: this.parentMessageId,
+        user: this.options.req.user,
+        supplementalMessages: storedMessages,
+        submittedMessages: checkpointUserMessages,
+        liveFiles,
+        isTemporary: this.options.req.body?.isTemporary === true,
+        getMessages: db.getMessages,
+        getFiles: db.getFiles,
+      });
       assertModelBoundContent({
         filters: appConfig?.filters,
         legacyPii: appConfig?.messageFilter?.pii,
-        submittedMessages: checkpointUserMessages,
-        storedMessages,
+        submittedMessages: fileInspection.submittedMessages,
+        storedMessages: fileInspection.storedMessages,
         agents,
         skills: checkpointSkills,
-        files: Array.isArray(this.options.req.body?.files) ? this.options.req.body.files : [],
+        files: [...modelBoundAgentFiles, ...dynamicToolContexts],
+        resolvedFiles: fileInspection.hydratedFiles,
       });
       assertResumeToolContentAllowed(appConfig?.filters, checkpointMessages, seedContent);
 
@@ -3644,7 +3736,7 @@ class AgentClient extends BaseClient {
           }
           logger.warn(
             '[api/server/controllers/agents/client.js #resumeCompletion] Failed to re-prime skill sessions',
-            err?.message ?? err,
+            getSafeErrorMetadata(err),
           );
         }
       }
@@ -3798,18 +3890,21 @@ class AgentClient extends BaseClient {
           '[api/server/controllers/agents/client.js #resumeCompletion] Aborted by user',
           {
             conversationId: this.conversationId,
-            name: err?.name,
-            code: err?.code,
+            ...getSafeErrorMetadata(err),
           },
         );
       } else {
         logger.error(
           '[api/server/controllers/agents/client.js #resumeCompletion] Unhandled error',
-          err,
+          getSafeErrorMetadata(err),
         );
         this.contentParts.push({
           type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: `An error occurred while resuming the request${err?.message ? `: ${err.message}` : ''}`,
+          [ContentTypes.ERROR]: getUserFacingRequestError(
+            'An error occurred while resuming the request',
+            err,
+            appConfig,
+          ),
         });
       }
     } finally {
@@ -3843,7 +3938,7 @@ class AgentClient extends BaseClient {
       } catch (err) {
         logger.error(
           '[api/server/controllers/agents/client.js #resumeCompletion] Error in cleanup phase',
-          err,
+          getSafeErrorMetadata(err),
         );
       }
       if (this._resolveRun) {
@@ -3957,7 +4052,7 @@ class AgentClient extends BaseClient {
       } catch (error) {
         logger.warn(
           `[api/server/controllers/agents/client.js #titleConvo] Error getting title endpoint config for "${endpointConfig.titleEndpoint}", falling back to default`,
-          error,
+          getSafeErrorMetadata(error),
         );
         // Fall back to original provider config
         endpoint = agent.endpoint;
@@ -4114,13 +4209,16 @@ class AgentClient extends BaseClient {
       }).catch((err) => {
         logger.error(
           '[api/server/controllers/agents/client.js #titleConvo] Error recording collected usage',
-          err,
+          getSafeErrorMetadata(err),
         );
       });
 
       return sanitizeTitle(titleResult.title);
     } catch (err) {
-      logger.error('[api/server/controllers/agents/client.js #titleConvo] Error', err);
+      logger.error(
+        '[api/server/controllers/agents/client.js #titleConvo] Error',
+        getSafeErrorMetadata(err),
+      );
       return;
     }
   }
@@ -4183,7 +4281,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #recordTokenUsage] Error recording token usage',
-        error,
+        getSafeErrorMetadata(error),
       );
     }
   }

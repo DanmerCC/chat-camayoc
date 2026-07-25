@@ -41,6 +41,8 @@ const {
   isNestedMessageTraversalProtected,
   assertModelBoundContent,
   isContentFilterError,
+  collectReachableAgents,
+  getSafeErrorMetadata,
   createToolExecuteHandler,
   getRemoteAgentPermissions,
   resolveAgentScopedSkillIds,
@@ -91,12 +93,21 @@ const {
 const { getModelsConfig } = require('~/server/controllers/ModelController');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { resolveConfigServers, getAccessibleMcpServerNames } = require('~/server/services/MCP');
+const { resolveConversationTitle } = require('~/server/services/Endpoints/titlePolicy');
 const { getMCPManager } = require('~/config');
 const { logViolation } = require('~/cache');
 const db = require('~/models');
 
 const filterFilesByRemoteAgentAccess = (params) =>
   filterFilesByAgentAccess({ ...params, resourceType: ResourceType.REMOTE_AGENT });
+const GENERIC_PROVIDER_ERROR = 'An error occurred while processing the request';
+
+function getUserFacingProviderError(error, appConfig) {
+  if (appConfig?.filters != null || appConfig?.messageFilter?.pii != null) {
+    return GENERIC_PROVIDER_ERROR;
+  }
+  return error instanceof Error ? error.message : 'An error occurred';
+}
 
 /**
  * Creates a tool loader function for the agent.
@@ -135,7 +146,7 @@ function createToolLoader(signal, definitionsOnly = true) {
       if (isFatalAgentInitializationError(error) || isContentFilterError(error)) {
         throw error;
       }
-      logger.error('Error loading tools for agent ' + agentId, error);
+      logger.error('Error loading tools for agent ' + agentId, getSafeErrorMetadata(error));
     }
   };
 }
@@ -147,6 +158,39 @@ function createToolLoader(signal, definitionsOnly = true) {
  */
 function convertToInternalMessages(input) {
   return convertInputToMessages(input);
+}
+
+/**
+ * Collect file-derived context exactly as it will be exposed to the model.
+ * Dynamic tool context uses the same synthesis as packages/api/src/agents/run.ts.
+ * @param {Array} agents
+ * @returns {Array}
+ */
+function collectModelBoundAgentFiles(agents) {
+  const files = [];
+  const seenFiles = new Set();
+  for (const agent of agents) {
+    for (const attachment of [
+      ...(agent?.attachments ?? []),
+      ...(agent?.requestAttachments ?? []),
+      ...(agent?.agentContextAttachments ?? []),
+    ]) {
+      if (attachment == null || seenFiles.has(attachment)) {
+        continue;
+      }
+      seenFiles.add(attachment);
+      files.push(attachment);
+    }
+
+    const dynamicToolInstructions = Object.values(agent?.dynamicToolContextMap ?? {})
+      .filter((value) => typeof value === 'string' && value !== '')
+      .join('\n')
+      .trim();
+    if (dynamicToolInstructions !== '') {
+      files.push({ content: dynamicToolInstructions });
+    }
+  }
+  return files;
 }
 
 function extractResponseRequestContent(request, messageFragments) {
@@ -216,27 +260,30 @@ async function loadPreviousMessages(conversationId, userId) {
 
     // Convert stored messages to internal format
     return messages.map((msg) => {
+      let text;
+      if (typeof msg.text === 'string') {
+        text = msg.text;
+      } else if (msg.text != null) {
+        text = String(msg.text);
+      }
       const internalMsg = {
         role: msg.isCreatedByUser ? 'user' : 'assistant',
-        content: '',
+        content: Array.isArray(msg.content) ? msg.content : (text ?? ''),
         messageId: msg.messageId,
         isCreatedByUser: msg.isCreatedByUser === true,
+        ...(text !== undefined && { text }),
+        ...(typeof msg.isUserSubmitted === 'boolean' && {
+          isUserSubmitted: msg.isUserSubmitted,
+        }),
+        ...(Array.isArray(msg.userSubmittedPaths) && {
+          userSubmittedPaths: msg.userSubmittedPaths,
+        }),
       };
-
-      // Handle content - could be string or array
-      if (typeof msg.text === 'string') {
-        internalMsg.content = msg.text;
-      } else if (Array.isArray(msg.content)) {
-        // Handle content parts
-        internalMsg.content = msg.content;
-      } else if (msg.text) {
-        internalMsg.content = String(msg.text);
-      }
 
       return internalMsg;
     });
   } catch (error) {
-    logger.error('[Responses API] Error loading previous messages:', error);
+    logger.error('[Responses API] Error loading previous messages:', getSafeErrorMetadata(error));
     return [];
   }
 }
@@ -323,6 +370,7 @@ async function saveResponseOutput(req, conversationId, responseId, response, age
  * @returns {Promise<void>}
  */
 async function saveConversation(req, conversationId, agentId, agent) {
+  const title = resolveConversationTitle(req, agent?.name || 'Open Responses Conversation');
   await db.saveConvo(
     {
       userId: req?.user?.id,
@@ -333,7 +381,7 @@ async function saveConversation(req, conversationId, agentId, agent) {
       conversationId,
       endpoint: EModelEndpoint.agents,
       agentId,
-      title: agent?.name || 'Open Responses Conversation',
+      ...(title != null && { title }),
       model: agent?.model,
     },
     { context: 'Responses API - save conversation' },
@@ -721,16 +769,18 @@ const executeResponse = async (envelope, { req, res }) => {
 
     primaryConfig.edges = discoveredEdges;
     const runAgents = [primaryConfig, ...handoffAgentConfigs.values()];
+    const modelBoundAgents = collectReachableAgents(runAgents);
     const mergedMCPAuthMap = discoveredMCPAuthMap ?? primaryConfig.userMCPAuthMap;
     assertModelBoundContent({
       filters: appConfig?.filters,
       legacyPii: appConfig?.messageFilter?.pii,
-      agents: runAgents,
+      agents: modelBoundAgents,
     });
 
-    const agentContextAttachmentsByAgentId = buildAgentContextAttachmentsByAgentId(runAgents);
+    const agentContextAttachmentsByAgentId =
+      buildAgentContextAttachmentsByAgentId(modelBoundAgents);
     const agentScopedContext = await buildAgentScopedContext({
-      agentIds: runAgents.map(({ id }) => id),
+      agentIds: modelBoundAgents.map(({ id }) => id),
       attachmentsByAgentId: agentContextAttachmentsByAgentId,
       req,
     });
@@ -739,7 +789,7 @@ const executeResponse = async (envelope, { req, res }) => {
     const configServers = await resolveConfigServers(req);
 
     await Promise.all(
-      runAgents.map((runAgent) =>
+      modelBoundAgents.map((runAgent) =>
         applyContextToAgent({
           agent: runAgent,
           agentId: runAgent.id,
@@ -808,9 +858,9 @@ const executeResponse = async (envelope, { req, res }) => {
       legacyPii: appConfig?.messageFilter?.pii,
       submittedMessages: inputMessages,
       storedMessages: previousMessages,
-      agents: runAgents,
+      agents: modelBoundAgents,
       skills: [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])],
-      files: [...agentContextAttachmentsByAgentId.values()].flat(),
+      files: collectModelBoundAgentFiles(modelBoundAgents),
     });
 
     /* Stable for the turn: the primary prime list is fixed once
@@ -969,7 +1019,7 @@ const executeResponse = async (envelope, { req, res }) => {
       await run.processStream({ messages: formattedMessages }, config, {
         callbacks: {
           [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-            logger.error(`[Responses API] Tool Error "${toolId}"`, error);
+            logger.error(`[Responses API] Tool Error "${toolId}"`, getSafeErrorMetadata(error));
           },
         },
       });
@@ -995,7 +1045,7 @@ const executeResponse = async (envelope, { req, res }) => {
           model: primaryConfig.model || agent.model_parameters?.model,
         },
       ).catch((err) => {
-        logger.error('[Responses API] Error recording usage:', err);
+        logger.error('[Responses API] Error recording usage:', getSafeErrorMetadata(err));
       });
 
       // Finalize the stream
@@ -1022,7 +1072,7 @@ const executeResponse = async (envelope, { req, res }) => {
             `[Responses API] Stored response ${responseId} in conversation ${conversationId}`,
           );
         } catch (saveError) {
-          logger.error('[Responses API] Error saving response:', saveError);
+          logger.error('[Responses API] Error saving response:', getSafeErrorMetadata(saveError));
           // Don't fail the request if saving fails
         }
       }
@@ -1030,7 +1080,10 @@ const executeResponse = async (envelope, { req, res }) => {
       // Wait for artifact processing after response ends (non-blocking)
       if (artifactPromises.length > 0) {
         Promise.all(artifactPromises).catch((artifactError) => {
-          logger.warn('[Responses API] Error processing artifacts:', artifactError);
+          logger.warn(
+            '[Responses API] Error processing artifacts:',
+            getSafeErrorMetadata(artifactError),
+          );
         });
       }
     } else {
@@ -1151,7 +1204,7 @@ const executeResponse = async (envelope, { req, res }) => {
       await run.processStream({ messages: formattedMessages }, config, {
         callbacks: {
           [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-            logger.error(`[Responses API] Tool Error "${toolId}"`, error);
+            logger.error(`[Responses API] Tool Error "${toolId}"`, getSafeErrorMetadata(error));
           },
         },
       });
@@ -1177,14 +1230,17 @@ const executeResponse = async (envelope, { req, res }) => {
           model: primaryConfig.model || agent.model_parameters?.model,
         },
       ).catch((err) => {
-        logger.error('[Responses API] Error recording usage:', err);
+        logger.error('[Responses API] Error recording usage:', getSafeErrorMetadata(err));
       });
 
       if (artifactPromises.length > 0) {
         try {
           await Promise.all(artifactPromises);
         } catch (artifactError) {
-          logger.warn('[Responses API] Error processing artifacts:', artifactError);
+          logger.warn(
+            '[Responses API] Error processing artifacts:',
+            getSafeErrorMetadata(artifactError),
+          );
         }
       }
 
@@ -1202,7 +1258,7 @@ const executeResponse = async (envelope, { req, res }) => {
             `[Responses API] Stored response ${responseId} in conversation ${conversationId}`,
           );
         } catch (saveError) {
-          logger.error('[Responses API] Error saving response:', saveError);
+          logger.error('[Responses API] Error saving response:', getSafeErrorMetadata(saveError));
           // Don't fail the request if saving fails
         }
       }
@@ -1215,8 +1271,8 @@ const executeResponse = async (envelope, { req, res }) => {
       );
     }
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'An error occurred';
-    logger.error('[Responses API] Error:', error);
+    logger.error('[Responses API] Error:', getSafeErrorMetadata(error));
+    const errorMessage = getUserFacingProviderError(error, appConfig);
 
     // Check if we already started streaming (headers sent)
     if (res.headersSent) {
@@ -1332,7 +1388,7 @@ const listModels = async (req, res) => {
       data: models,
     });
   } catch (error) {
-    logger.error('[Responses API] Error listing models:', error);
+    logger.error('[Responses API] Error listing models:', getSafeErrorMetadata(error));
     sendResponsesErrorResponse(
       res,
       500,
@@ -1437,7 +1493,7 @@ const getResponse = async (req, res) => {
 
     res.json(response);
   } catch (error) {
-    logger.error('[Responses API] Error getting response:', error);
+    logger.error('[Responses API] Error getting response:', getSafeErrorMetadata(error));
     sendResponsesErrorResponse(
       res,
       500,

@@ -33,7 +33,7 @@ const {
   getServerGenerationProtocol,
   negotiateExistingGenerationProtocol,
 } = require('~/server/controllers/agents/protocol');
-const { saveMessage } = require('~/models');
+const { getFiles, saveMessage } = require('~/models');
 const responses = require('./responses');
 const openai = require('./openai');
 const { v1 } = require('./v1');
@@ -732,6 +732,10 @@ router.post('/chat/abort', configMiddleware, async (req, res, next) => {
               unfinished: true,
               error: false,
               isCreatedByUser: false,
+              ...(Array.isArray(jobData.userSubmittedPaths) &&
+                jobData.userSubmittedPaths.length > 0 && {
+                  userSubmittedPaths: jobData.userSubmittedPaths,
+                }),
               user: userId,
             };
 
@@ -915,6 +919,7 @@ router.post(
   createMessageFilterPii({
     getConfig: (req) => req.config?.messageFilter?.pii,
     getFilters: (req) => req.config?.filters,
+    getFiles,
   }),
   moderateText,
   SteerController,
