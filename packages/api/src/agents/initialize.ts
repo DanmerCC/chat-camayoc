@@ -39,6 +39,8 @@ import type {
 } from '~/types';
 import type { LCAvailableTools, RequestScopedMCPConnectionStore } from '../mcp/types';
 import type { TFilterFilesByAgentAccess } from './resources';
+import type { ContentTraversalLimitError } from '../protection/adapters/nested';
+import type { TextContentFragment } from '../protection/types';
 import {
   injectSkillCatalog,
   resolveSkillCatalog,
@@ -70,6 +72,11 @@ import {
   isFileAuthoringToolDefinition,
 } from './tools';
 import { extractAgentContent, extractSkillContent } from '../protection/adapters/submissions';
+import {
+  getContentTraversalFragments,
+  isContentTraversalProtected,
+  isContentTraversalLimitError,
+} from '../protection/adapters/nested';
 import { assertModelBoundContent } from '../middleware/modelBoundContent';
 import { registerMemoryTools, memoryToolUsageGuard } from './memory';
 import { applyIntentLabels, sanitizeIntentLabels } from './intent';
@@ -626,14 +633,33 @@ export async function initializeAgent(
    * definition fragments directly here: the raw agent may still contain
    * canonical file IDs that can only be validated after resource hydration.
    */
-  const agentDefinitionFinding = inspectContent(
-    extractAgentContent(agent as unknown as Parameters<typeof extractAgentContent>[0]),
-    {
-      filters: req.config?.filters,
-    },
-  );
+  let agentFragments: readonly TextContentFragment[] = [];
+  let agentTraversalError: ContentTraversalLimitError | null = null;
+  try {
+    agentFragments = extractAgentContent(
+      agent as unknown as Parameters<typeof extractAgentContent>[0],
+    );
+  } catch (error) {
+    if (!isContentTraversalLimitError(error)) {
+      throw error;
+    }
+    agentFragments = getContentTraversalFragments(error);
+    agentTraversalError = error;
+  }
+  const agentDefinitionFinding = inspectContent(agentFragments, {
+    filters: req.config?.filters,
+  });
   if (agentDefinitionFinding != null) {
     throw new ContentFilterError(agentDefinitionFinding);
+  }
+  if (
+    agentTraversalError != null &&
+    isContentTraversalProtected({
+      error: agentTraversalError,
+      filters: req.config?.filters,
+    })
+  ) {
+    throw agentTraversalError;
   }
 
   /**

@@ -36,8 +36,9 @@ const {
   contentFilterUninspectableResponse,
   discoverConnectedAgents,
   getBlockedOpaqueFileField,
+  getContentTraversalFragments,
+  isContentTraversalProtected,
   isContentTraversalLimitError,
-  isNestedMessageTraversalProtected,
   assertModelBoundContent,
   isContentFilterError,
   collectReachableAgents,
@@ -245,7 +246,7 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
   }
 
   const messageFragments = [];
-  let traversalError = null;
+  const traversalErrors = [];
   try {
     for (const fragment of extractMessageContent(request.messages)) {
       messageFragments.push(fragment);
@@ -254,14 +255,20 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
     if (!isContentTraversalLimitError(error)) {
       throw error;
     }
-    traversalError = error;
+    messageFragments.push(...getContentTraversalFragments(error));
+    traversalErrors.push(error);
+  }
+  try {
+    messageFragments.push(...extractModelParameterContent(request));
+  } catch (error) {
+    if (!isContentTraversalLimitError(error)) {
+      throw error;
+    }
+    messageFragments.push(...getContentTraversalFragments(error));
+    traversalErrors.push(error);
   }
   const contentFinding = inspectContent(
-    [
-      ...messageFragments,
-      ...extractModelParameterContent(request),
-      ...(manualSkills ?? []).flatMap((name) => extractSkillContent({ name })),
-    ],
+    [...messageFragments, ...(manualSkills ?? []).flatMap((name) => extractSkillContent({ name }))],
     {
       filters: appConfig?.filters,
       legacyPii: appConfig?.messageFilter?.pii,
@@ -280,14 +287,15 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
       isLegacyFilter ? 'message_filter_pii_block' : blockResponse.error,
     );
   }
-  if (
-    traversalError != null &&
-    isNestedMessageTraversalProtected({
+  const traversalError = traversalErrors.find((error) =>
+    isContentTraversalProtected({
+      error,
       filters: appConfig?.filters,
       legacyPii: appConfig?.messageFilter?.pii,
       roles: request.messages.map((message) => message?.role),
-    })
-  ) {
+    }),
+  );
+  if (traversalError != null) {
     return sendErrorResponse(
       res,
       traversalError.statusCode,
