@@ -79,8 +79,8 @@ export async function cleanupMCPRequestContext(context?: MCPRequestContext): Pro
         } else {
           await connection.disconnect();
         }
-      } catch (error) {
-        logger.warn('[MCP Request Context] Failed to dispose request-scoped connection', error);
+      } catch {
+        logger.warn('[MCP Request Context] Failed to dispose request-scoped connection');
       }
     }),
   );
@@ -94,8 +94,8 @@ function isResponseFinished(res?: MCPResponseLike): boolean {
 }
 
 function runCleanup(context: MCPRequestContext): void {
-  cleanupMCPRequestContext(context).catch((error) => {
-    logger.warn('[MCP Request Context] Cleanup failed', error);
+  cleanupMCPRequestContext(context).catch(() => {
+    logger.warn('[MCP Request Context] Cleanup failed');
   });
 }
 

@@ -40,8 +40,10 @@ const {
   captureResumeModelParameters,
   pickResumeContext,
   getApprovalTtlMs,
+  getAgentCheckpointer,
   isHITLEnabled,
   captureAgentCheckpointGeneration,
+  isContentFilterError,
   deleteAgentCheckpoint,
   LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
   agentRequestsAskUserQuestion,
@@ -100,6 +102,10 @@ const {
   resolveYouTubeInjectionConfig,
   decrementPendingRequest,
   maybePrewarmCodeSandbox,
+  assertModelBoundContent,
+  extractStoredMessageContent,
+  inspectContent,
+  ContentFilterError,
 } = require('@librechat/api');
 const {
   Run,
@@ -139,6 +145,104 @@ const db = require('~/models');
 const loadAgent = (params) => loadAgentFn(params, { getAgent: db.getAgent, getMCPServerTools });
 
 const MEMORY_INPUT_CHARS_PER_TOKEN = 8;
+
+function getCheckpointMessageRole(message) {
+  const type = message?._getType?.() ?? message?.role;
+  if (type === 'human') {
+    return 'user';
+  }
+  if (type === 'ai') {
+    return 'assistant';
+  }
+  return type;
+}
+
+function getCheckpointSkill(message) {
+  if (!isSkillPrimeMessage(message)) {
+    return null;
+  }
+  const content = message?.content;
+  let body = '';
+  if (typeof content === 'string') {
+    body = content;
+  } else if (Array.isArray(content)) {
+    body = content
+      .map((part) => {
+        if (typeof part === 'string') {
+          return part;
+        }
+        return typeof part?.text === 'string' ? part.text : '';
+      })
+      .join('');
+  }
+  return {
+    name: message?.additional_kwargs?.skillName,
+    body,
+  };
+}
+
+function normalizeCheckpointToolCalls(message) {
+  const calls = [
+    ...(Array.isArray(message?.tool_calls) ? message.tool_calls : []),
+    ...(Array.isArray(message?.additional_kwargs?.tool_calls)
+      ? message.additional_kwargs.tool_calls
+      : []),
+  ];
+  return calls.map((call) => ({
+    name: call?.name,
+    arguments: call?.args ?? call?.arguments,
+    output: call?.output,
+    function: call?.function,
+    code_interpreter: call?.code_interpreter,
+  }));
+}
+
+async function getResumeCheckpointMessages(appConfig, conversationId) {
+  const checkpointer = await getAgentCheckpointer(
+    appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer,
+  );
+  if (!checkpointer) {
+    return [];
+  }
+  const tuple = await checkpointer.getTuple({
+    configurable: {
+      thread_id: conversationId,
+      checkpoint_ns: '',
+    },
+  });
+  const messages = tuple?.checkpoint?.channel_values?.messages;
+  return Array.isArray(messages) ? messages : [];
+}
+
+function assertResumeToolContentAllowed(filters, messages, seedContent) {
+  if (filters?.toolArguments?.pii == null) {
+    return;
+  }
+  const fragments = [];
+  for (const message of messages) {
+    const content = message?.content;
+    fragments.push(
+      ...extractStoredMessageContent({
+        role: getCheckpointMessageRole(message),
+        text: typeof content === 'string' ? content : undefined,
+        content: Array.isArray(content) ? content : undefined,
+        tool_calls: normalizeCheckpointToolCalls(message),
+      }),
+    );
+  }
+  fragments.push(
+    ...extractStoredMessageContent({
+      role: 'assistant',
+      content: Array.isArray(seedContent) ? seedContent : undefined,
+    }),
+  );
+  const finding = inspectContent(fragments, {
+    filters: { toolArguments: filters.toolArguments },
+  });
+  if (finding != null) {
+    throw new ContentFilterError(finding);
+  }
+}
 
 class AgentClient extends BaseClient {
   constructor(options = {}) {
@@ -385,6 +489,11 @@ class AgentClient extends BaseClient {
           user: this.options.req?.user,
           item,
           getFiles: db.getFiles,
+          assertFilesAllowed: (files) =>
+            assertModelBoundContent({
+              filters: this.options.req?.config?.filters,
+              files,
+            }),
         }),
     };
     return {
@@ -1407,6 +1516,8 @@ class AgentClient extends BaseClient {
     let payload;
     /** @type {number | undefined} */
     let promptTokens;
+    const modelBoundMemoryContexts = new Set();
+    const modelBoundFileContexts = new Set();
 
     /** Normalize instruction fields before applying per-run context. */
     const normalizeInstructions = (agent) => {
@@ -1425,7 +1536,6 @@ class AgentClient extends BaseClient {
           }))
         : []),
     ];
-
     /**
      * Memory authorization/loading and MCP config resolution do not depend on
      * attachment hydration or prompt formatting. Start them before that work,
@@ -1441,6 +1551,12 @@ class AgentClient extends BaseClient {
     ]);
     void earlySharedContextPromise.catch(() => {});
 
+    assertModelBoundContent({
+      filters: this.options.req.config?.filters,
+      legacyPii: this.options.req.config?.messageFilter?.pii,
+      storedMessages: orderedMessages,
+      agents: allAgents.map(({ agent }) => agent),
+    });
     const sharedRunAttachmentIds = new Set();
     /** @type {ReturnType<typeof buildAgentScopedContext>} */
     let agentScopedContextPromise;
@@ -1460,6 +1576,15 @@ class AgentClient extends BaseClient {
       const attachments = await this.options.attachments;
       const latestMessage = orderedMessages[orderedMessages.length - 1];
 
+      assertModelBoundContent({
+        filters: this.options.req.config?.filters,
+        files: attachments,
+      });
+      for (const attachment of attachments) {
+        if (attachment) {
+          modelBoundFileContexts.add(attachment);
+        }
+      }
       for (const fileId of collectFileIds(attachments)) {
         sharedRunAttachmentIds.add(fileId);
       }
@@ -1519,6 +1644,7 @@ class AgentClient extends BaseClient {
        * too instead of living only in the dynamic system tail.
        */
       if (message.fileContext) {
+        modelBoundFileContexts.add(message.fileContext);
         hasFileContext = true;
         prependFileContext(formattedMessage, message.fileContext);
       }
@@ -1576,6 +1702,9 @@ class AgentClient extends BaseClient {
       if (this.message_file_map && this.message_file_map[message.messageId]) {
         const attachments = this.message_file_map[message.messageId];
         for (const file of attachments) {
+          if (file) {
+            modelBoundFileContexts.add(file);
+          }
           if (file.embedded) {
             this.contextHandlers?.processFile(file);
             continue;
@@ -1710,6 +1839,7 @@ class AgentClient extends BaseClient {
     /** Augmented prompt from RAG/context handlers */
     this.augmentedPrompt = augmentedPrompt;
     if (this.augmentedPrompt) {
+      modelBoundFileContexts.add(this.augmentedPrompt);
       sharedRunContextParts.push(this.augmentedPrompt);
     }
 
@@ -1744,10 +1874,51 @@ class AgentClient extends BaseClient {
         return undefined;
       }
     };
+    const canonicalMemoryCache = new Map();
+    const getCanonicalAgentMemories = async (agent) => {
+      if (
+        this.options.req.config?.filters?.memories?.pii == null ||
+        typeof db.getUserMemories !== 'function'
+      ) {
+        return undefined;
+      }
+      const agentId = getMemoryAgentId(agent);
+      const cacheKey = agentId ?? '__shared__';
+      if (!canonicalMemoryCache.has(cacheKey)) {
+        canonicalMemoryCache.set(
+          cacheKey,
+          db
+            .getUserMemories({
+              userId: this.options.req.user.id + '',
+              agentId,
+            })
+            .catch((error) => {
+              logger.error('[AgentClient] Error loading memories for content inspection', {
+                name: error?.name,
+                code: error?.code,
+              });
+              return undefined;
+            }),
+        );
+      }
+      return canonicalMemoryCache.get(cacheKey);
+    };
 
     const sharedRunContext = sharedRunContextParts.join('\n\n');
     const memoryAgentEnabled = isMemoryAgentEnabled(this.options.req.config?.memory);
 
+    const contextAttachments = this.options.agentContextAttachmentsByAgentId;
+    const attachmentLists =
+      contextAttachments instanceof Map
+        ? [...contextAttachments.values()]
+        : Object.values(contextAttachments ?? {});
+    for (const attachments of attachmentLists) {
+      for (const attachment of attachments ?? []) {
+        if (attachment) {
+          modelBoundFileContexts.add(attachment);
+        }
+      }
+    }
     /** Preserve prompt token counts for graph formatting and pruning. */
     this.indexTokenCountMap = indexTokenCountMap;
 
@@ -1787,6 +1958,19 @@ class AgentClient extends BaseClient {
         const agentHasMemory = agentHasInlineMemoryTools(agent);
         if (agentId === this.options.agent.id || memoryAgentEnabled || agentHasMemory) {
           const partitionMemories = await getAgentPartitionMemories(agent);
+          const canonicalMemories =
+            partitionMemories != null ? await getCanonicalAgentMemories(agent) : undefined;
+          if (canonicalMemories != null) {
+            for (const memory of canonicalMemories) {
+              modelBoundMemoryContexts.add(memory);
+            }
+          }
+          if (partitionMemories?.withoutKeys) {
+            /** Inspect the exact formatted value text that will be model-bound as
+             *  well as canonical rows. This also covers custom embedders, read
+             *  failures, and an unexpectedly empty canonical result. */
+            modelBoundMemoryContexts.add(partitionMemories.withoutKeys);
+          }
           const agentMemoryContext = buildMemoryContext(
             agentHasMemory ? partitionMemories?.withKeys : partitionMemories?.withoutKeys,
           );
@@ -1796,6 +1980,7 @@ class AgentClient extends BaseClient {
         }
         const scopedContext = agentScopedContext.get(agentId);
         if (scopedContext) {
+          modelBoundFileContexts.add(scopedContext);
           agentRunContextParts.push(scopedContext);
         }
 
@@ -1810,6 +1995,15 @@ class AgentClient extends BaseClient {
         });
       }),
     );
+    this.modelBoundMemoryContexts = [...modelBoundMemoryContexts];
+    this.modelBoundFileContexts = [...modelBoundFileContexts];
+    assertModelBoundContent({
+      filters: this.options.req.config?.filters,
+      legacyPii: this.options.req.config?.messageFilter?.pii,
+      agents: allAgents.map(({ agent }) => agent),
+      memories: this.modelBoundMemoryContexts,
+      files: this.modelBoundFileContexts,
+    });
 
     return result;
   }
@@ -1989,6 +2183,7 @@ class AgentClient extends BaseClient {
       userId,
       agentId: memoryAgentId,
       config,
+      filters: this.options.req.config?.filters,
       messageId,
       streamId,
       jobCreatedAt: this.jobCreatedAt,
@@ -2884,10 +3079,9 @@ class AgentClient extends BaseClient {
         });
         indexTokenCountMap = primeResult.indexTokenCountMap;
         if (primeResult.inserted > 0) {
-          const manualNames = (manualSkillPrimes ?? []).map((p) => p.name);
-          const alwaysApplyNames = (alwaysApplySkillPrimes ?? []).map((p) => p.name);
           logger.debug(
-            `[AgentClient] Primed ${primeResult.inserted} skill(s) at message index ${primeResult.insertIdx} — manual: [${manualNames.join(', ')}], always-apply: [${alwaysApplyNames.join(', ')}]`,
+            `[AgentClient] Primed ${primeResult.inserted} skill(s) at message index ${primeResult.insertIdx} ` +
+              `(${manualSkillPrimes?.length ?? 0} manual, ${alwaysApplySkillPrimes?.length ?? 0} always-apply)`,
           );
         }
         if (primeResult.alwaysApplyDropped > 0) {
@@ -2896,6 +3090,15 @@ class AgentClient extends BaseClient {
           );
         }
       }
+
+      assertModelBoundContent({
+        filters: appConfig?.filters,
+        legacyPii: appConfig?.messageFilter?.pii,
+        agents: [this.options.agent, ...(this.agentConfigs?.values() ?? [])],
+        skills: [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])],
+        memories: this.modelBoundMemoryContexts,
+        files: this.modelBoundFileContexts,
+      });
 
       if (indexTokenCountMap && isEnabled(process.env.AGENT_DEBUG_LOGGING)) {
         const entries = Object.entries(indexTokenCountMap);
@@ -3326,6 +3529,7 @@ class AgentClient extends BaseClient {
    * @param {Array} [params.seedContent] - content aggregated before the pause
    * @param {Array<import('@librechat/agents').RunStep>} [params.runSteps] - run steps emitted before the pause
    * @param {import('@librechat/api').ActivityPhaseSnapshot} [params.activityPhaseSnapshot]
+   * @param {Array} [params.storedMessages] - persisted user messages restored for the resume
    * @param {AbortController} [params.abortController]
    * @param {Pick<import('@langchain/langgraph').Command, 'update' | 'goto'>} [params.commandOptions]
    */
@@ -3333,6 +3537,7 @@ class AgentClient extends BaseClient {
     resumeValue,
     seedContent = [],
     runSteps = [],
+    storedMessages = [],
     abortController = null,
     commandOptions,
     userMCPAuthMap,
@@ -3387,6 +3592,36 @@ class AgentClient extends BaseClient {
       if (this.agentConfigs && this.agentConfigs.size > 0) {
         agents.push(...this.agentConfigs.values());
       }
+      const checkpointMessages =
+        appConfig?.filters != null || appConfig?.messageFilter?.pii != null
+          ? await getResumeCheckpointMessages(appConfig, this.conversationId)
+          : [];
+      const checkpointUserMessages = [];
+      const checkpointSkills = [];
+      for (const message of checkpointMessages) {
+        const skill = getCheckpointSkill(message);
+        if (skill != null) {
+          checkpointSkills.push(skill);
+          continue;
+        }
+        if (getCheckpointMessageRole(message) === 'user') {
+          checkpointUserMessages.push({
+            ...message,
+            role: 'user',
+            content: message?.content ?? message?.text,
+          });
+        }
+      }
+      assertModelBoundContent({
+        filters: appConfig?.filters,
+        legacyPii: appConfig?.messageFilter?.pii,
+        submittedMessages: checkpointUserMessages,
+        storedMessages,
+        agents,
+        skills: checkpointSkills,
+        files: Array.isArray(this.options.req.body?.files) ? this.options.req.body.files : [],
+      });
+      assertResumeToolContentAllowed(appConfig?.filters, checkpointMessages, seedContent);
 
       // Re-prime skill files invoked in the pre-pause segment (mirrors the normal path's
       // `primeInvokedSkills(payload)`), so an approved code/file-backed tool keeps the
@@ -3404,6 +3639,9 @@ class AgentClient extends BaseClient {
           ]);
           skillSessions = primed?.initialSessions;
         } catch (err) {
+          if (isContentFilterError(err)) {
+            throw err;
+          }
           logger.warn(
             '[api/server/controllers/agents/client.js #resumeCompletion] Failed to re-prime skill sessions',
             err?.message ?? err,
@@ -3544,6 +3782,17 @@ class AgentClient extends BaseClient {
       this.applyHideSequentialOutputsFilter();
       this.rebaseActivityPhaseBounds(contentBeforeReshape);
     } catch (err) {
+      if (isContentFilterError(err)) {
+        logger.warn(
+          '[api/server/controllers/agents/client.js #resumeCompletion] Blocked by content policy',
+          {
+            source: err?.body?.source,
+            field: err?.body?.field,
+            code: err?.code,
+          },
+        );
+        throw err;
+      }
       if (abortController.signal.aborted) {
         logger.debug(
           '[api/server/controllers/agents/client.js #resumeCompletion] Aborted by user',

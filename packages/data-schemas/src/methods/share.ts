@@ -57,6 +57,15 @@ async function findOlderActiveShare(
   return rivals.some((rival) => isEarlierShare(rival, created));
 }
 
+export interface SharedLinkContentSnapshot {
+  readonly title: string;
+  readonly messages: readonly t.IMessage[];
+}
+
+export type SharedLinkContentPreflight = (
+  snapshot: SharedLinkContentSnapshot,
+) => void | Promise<void>;
+
 function memoizedAnonymizeId(prefix: string) {
   const memo = new Map<string, string>();
   return (id: string) => {
@@ -736,6 +745,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
     targetMessageId?: string,
     expiredAt?: Date,
     snapshotFiles?: boolean,
+    preflight?: SharedLinkContentPreflight,
   ) => Promise<t.CreateShareResult>;
   updateSharedLink: (
     user: string,
@@ -743,6 +753,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
     targetMessageId?: string,
     expiredAt?: Date | null,
     snapshotFiles?: boolean,
+    preflight?: SharedLinkContentPreflight,
   ) => Promise<t.UpdateShareResult>;
   deleteSharedLink: (user: string, shareId: string) => Promise<t.DeleteShareResult | null>;
   getSharedMessages: (
@@ -1023,10 +1034,12 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
     targetMessageId?: string,
     expiredAt?: Date,
     snapshotFiles: boolean = true,
+    preflight?: SharedLinkContentPreflight,
   ): Promise<t.CreateShareResult> {
     if (!user || !conversationId) {
       throw new ShareServiceError('Missing required parameters', 'INVALID_PARAMS');
     }
+    let preflightFailed = false;
     try {
       const Message = mongoose.models.Message as SchemaWithMeiliMethods;
       const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
@@ -1080,6 +1093,12 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
       const title = conversation.title || 'Untitled';
 
       const messagesForSnapshot = conversationMessages as unknown as t.IMessage[];
+      try {
+        await preflight?.({ title, messages: messagesForSnapshot });
+      } catch (error) {
+        preflightFailed = true;
+        throw error;
+      }
       const fileSnapshots = snapshotFiles
         ? await buildFileSnapshots(
             mongoose,
@@ -1120,6 +1139,9 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
 
       return { _id: created._id.toString(), shareId, conversationId, targetMessageId };
     } catch (error) {
+      if (preflightFailed) {
+        throw error;
+      }
       if (error instanceof ShareServiceError) {
         throw error;
       }
@@ -1190,11 +1212,13 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
     targetMessageId?: string,
     expiredAt?: Date | null,
     snapshotFiles: boolean = true,
+    preflight?: SharedLinkContentPreflight,
   ): Promise<t.UpdateShareResult> {
     if (!user || !shareId) {
       throw new ShareServiceError('Missing required parameters', 'INVALID_PARAMS');
     }
 
+    let preflightFailed = false;
     try {
       const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
       const Message = mongoose.models.Message as SchemaWithMeiliMethods;
@@ -1231,6 +1255,15 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
             )
           : undefined);
       const messagesForSnapshot = updatedMessages as unknown as t.IMessage[];
+      try {
+        await preflight?.({
+          title: share.title || 'Untitled',
+          messages: messagesForSnapshot,
+        });
+      } catch (error) {
+        preflightFailed = true;
+        throw error;
+      }
       const fileSnapshots = snapshotFiles
         ? await buildFileSnapshots(
             mongoose,
@@ -1275,6 +1308,9 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
         targetMessageId: updatedShare.targetMessageId,
       };
     } catch (error) {
+      if (preflightFailed) {
+        throw error;
+      }
       logger.error('[updateSharedLink] Error updating shared link', {
         error: error instanceof Error ? error.message : 'Unknown error',
         user,
