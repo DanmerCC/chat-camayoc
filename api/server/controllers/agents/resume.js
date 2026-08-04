@@ -26,12 +26,9 @@ const {
   filterMalformedContentParts,
   getAgentCheckpointer,
   isContentFilterError,
-  assertResumeContentAllowed,
+  preflightResumeContent,
+  getResumeProvenance,
   getUserFacingResumeError,
-  mergeUserSubmittedPaths,
-  mergeUserSubmittedMessageFieldPaths,
-  getResumeUserSubmittedPaths,
-  getResumeUserSubmittedMessageFieldPaths,
   decrementPendingRequest,
   checkAndIncrementPendingRequest,
   isSteerPreemptSupported,
@@ -212,14 +209,13 @@ async function persistRePauseProgress({ req, client, job, streamId, conversation
     return;
   }
   const content = await resolveSegmentContent(client, streamId, job.createdAt);
-  const userSubmittedPaths = mergeUserSubmittedPaths(
-    meta.userSubmittedPaths,
-    getResumeUserSubmittedPaths(content, meta.pendingAction, req.body),
-  );
-  const userSubmittedMessageFieldPaths = mergeUserSubmittedMessageFieldPaths(
-    meta.userSubmittedMessageFieldPaths,
-    getResumeUserSubmittedMessageFieldPaths(content, meta.pendingAction, req.body),
-  );
+  const { userSubmittedPaths, userSubmittedMessageFieldPaths } = getResumeProvenance({
+    content,
+    pendingAction: meta.pendingAction,
+    body: req.body,
+    existingPaths: meta.userSubmittedPaths,
+    existingMessageFieldPaths: meta.userSubmittedMessageFieldPaths,
+  });
   const attachments = await resolveAccumulatedAttachments({
     client,
     conversationId,
@@ -350,14 +346,13 @@ async function finalizeResumedTurn({
   // drop empty/malformed tool_call parts so a resumed turn can't persist an invalid
   // part that breaks reload/rendering.
   const content = filterMalformedContentParts(rawContent);
-  const userSubmittedPaths = mergeUserSubmittedPaths(
-    meta.userSubmittedPaths,
-    getResumeUserSubmittedPaths(content, meta.pendingAction, req.body),
-  );
-  const userSubmittedMessageFieldPaths = mergeUserSubmittedMessageFieldPaths(
-    meta.userSubmittedMessageFieldPaths,
-    getResumeUserSubmittedMessageFieldPaths(content, meta.pendingAction, req.body),
-  );
+  const { userSubmittedPaths, userSubmittedMessageFieldPaths } = getResumeProvenance({
+    content,
+    pendingAction: meta.pendingAction,
+    body: req.body,
+    existingPaths: meta.userSubmittedPaths,
+    existingMessageFieldPaths: meta.userSubmittedMessageFieldPaths,
+  });
 
   /**
    * A resumed segment can end on an empty preempt boundary just as a fresh
@@ -820,14 +815,10 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     }
   }
 
-  let seedContent;
-  let userSubmittedPaths;
-  let userSubmittedMessageFieldPaths;
-  let storedMessages;
   let resumeState;
+  let preparedContent;
   try {
     resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt);
-    seedContent = resumeState?.aggregatedContent ?? [];
     const batchedAnswer =
       mapped.resumeValue?.answers != null &&
       typeof mapped.resumeValue.answers === 'object' &&
@@ -840,53 +831,38 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       batchedAnswer === undefined
         ? mapped.resumeValue
         : { ...mapped.resumeValue, answer: batchedAnswer };
-    const currentUserSubmittedMessageFieldPaths = getResumeUserSubmittedMessageFieldPaths(
-      seedContent,
-      pendingAction,
-      provenanceBody,
-    );
-    if (resolvedAskUserQuestions) {
-      seedContent = attachAskUserQuestionAnswers(seedContent, resolvedAskUserQuestions);
-    }
-    userSubmittedPaths = mergeUserSubmittedPaths(
-      job.metadata.userSubmittedPaths,
-      getResumeUserSubmittedPaths(seedContent, pendingAction, req.body),
-    );
-    userSubmittedMessageFieldPaths = mergeUserSubmittedMessageFieldPaths(
-      job.metadata.userSubmittedMessageFieldPaths,
-      currentUserSubmittedMessageFieldPaths,
-    );
-    storedMessages = job.metadata.userMessage
-      ? [
-          {
-            ...job.metadata.userMessage,
-            isCreatedByUser: true,
-            role: 'user',
-            files: req.body.files,
-          },
-          {
-            messageId: job.metadata.responseMessageId,
-            parentMessageId: job.metadata.userMessage.messageId,
-            isCreatedByUser: false,
-            role: 'assistant',
-            content: seedContent,
-            userSubmittedPaths,
-            userSubmittedMessageFieldPaths,
-          },
-        ]
-      : [];
-    await assertResumeContentAllowed(
+    const retainedAskAnswers = job.metadata.resolvedAskUserQuestions;
+    const initialSeedContent = resumeState?.aggregatedContent ?? [];
+    const preflightResumeState =
+      Array.isArray(retainedAskAnswers) && retainedAskAnswers.length > 0
+        ? {
+            ...(resumeState ?? {}),
+            aggregatedContent: attachAskUserQuestionAnswers(initialSeedContent, retainedAskAnswers),
+          }
+        : resumeState;
+    const preflightPendingAction =
+      batchedAnswer !== undefined && Array.isArray(pendingAction.payload.questions)
+        ? {
+            ...pendingAction,
+            payload: {
+              ...pendingAction.payload,
+              question: { questions: pendingAction.payload.questions },
+            },
+          }
+        : pendingAction;
+    preparedContent = await preflightResumeContent(
       {
         appConfig: req.config,
         endpointOption: req.body.endpointOption,
         conversationId,
-        targetMessageId: job.metadata.userMessage?.messageId,
         user: req.user,
-        storedMessages,
-        seedContent,
+        jobMetadata: job.metadata,
+        pendingAction: preflightPendingAction,
+        body: provenanceBody,
         resumeValue: resumeValueForInspection,
+        resumeState: preflightResumeState,
         liveFiles: Array.isArray(req.body.files) ? req.body.files : [],
-        isTemporary: (job.metadata.isTemporary ?? req.body?.isTemporary) === true,
+        isTemporary: job.metadata.isTemporary === true,
         checkpointNamespace,
         resolvedAddedAgent: req.resolvedAddedAgent,
       },
@@ -902,6 +878,8 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     }
     return sendGenerationJson(res, 500, { error: GENERIC_RESUME_ERROR }, generationProtocolVersion);
   }
+  const { seedContent, storedMessages, userSubmittedPaths, userSubmittedMessageFieldPaths } =
+    preparedContent;
 
   // Count the resume against the concurrency limit. The original turn released its slot
   // when it paused, so resuming must re-acquire one — otherwise pausing several turns
