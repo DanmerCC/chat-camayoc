@@ -9,6 +9,7 @@ import {
   paramEndpoints,
   isAgentsEndpoint,
   AgentCapabilities,
+  hasActivePiiFields,
   replaceSpecialVars,
   providerEndpointMap,
 } from 'librechat-data-provider';
@@ -777,7 +778,7 @@ export async function initializeAgent(
             defaultActiveOnShare: params.defaultActiveOnShare,
           })
         : Promise.resolve<ResolvedAlwaysApplySkill[] | undefined>(undefined),
-      req.config?.filters?.skills?.pii != null
+      hasActivePiiFields(req.config?.filters?.skills?.pii, ['name', 'description'])
         ? resolveSkillCatalog({
             accessibleSkillIds: params.accessibleSkillIds!,
             listSkillsByAccess: db.listSkillsByAccess,

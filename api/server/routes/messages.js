@@ -6,6 +6,7 @@ const {
   feedbackSchema,
   isAssistantsEndpoint,
   stripReasoningLabelMetadata,
+  HITL_MESSAGE_FILTER_FIELDS,
 } = require('librechat-data-provider');
 const {
   unescapeLaTeX,
@@ -20,6 +21,7 @@ const {
   extractStoredMessageContent,
   contentFilterBlockResponse,
   assertModelBoundContent,
+  hasActiveFilePolicy,
   getContentTraversalFragments,
   isContentTraversalLimitError,
   isContentTraversalProtected,
@@ -118,6 +120,28 @@ const mergeUserSubmittedPaths = (...pathLists) => [
       .filter((path) => typeof path === 'string' && path.startsWith('/') && path.length <= 2048),
   ),
 ];
+const hitlMessageFilterFields = new Set(HITL_MESSAGE_FILTER_FIELDS);
+const mergeUserSubmittedMessageFieldPaths = (...entryLists) => {
+  const entries = [];
+  const seen = new Set();
+  for (const entry of entryLists.flat()) {
+    if (
+      entry == null ||
+      typeof entry.path !== 'string' ||
+      !entry.path.startsWith('/') ||
+      entry.path.length > 2048 ||
+      !hitlMessageFilterFields.has(entry.field)
+    ) {
+      continue;
+    }
+    const key = `${entry.field}:${entry.path}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      entries.push(entry);
+    }
+  }
+  return entries;
+};
 
 router.use(requireJwtAuth);
 
@@ -248,9 +272,17 @@ router.post('/branch', configMiddleware, async (req, res) => {
     const sourceUserSubmittedPaths = Array.isArray(sourceMessage.userSubmittedPaths)
       ? sourceMessage.userSubmittedPaths.filter((path) => typeof path === 'string')
       : [];
+    const sourceUserSubmittedMessageFieldPaths = Array.isArray(
+      sourceMessage.userSubmittedMessageFieldPaths,
+    )
+      ? sourceMessage.userSubmittedMessageFieldPaths.filter(
+          (entry) => entry != null && typeof entry.path === 'string',
+        )
+      : [];
     const remappedUserSubmittedPaths = sourceUserSubmittedPaths.filter((path) =>
       path.startsWith('/attachments/'),
     );
+    const remappedUserSubmittedMessageFieldPaths = [];
     for (let sourceIndex = 0; sourceIndex < sourceMessage.content.length; sourceIndex++) {
       const part = sourceMessage.content[sourceIndex];
       if (part?.agentId === agentId) {
@@ -262,6 +294,14 @@ router.post('/branch', configMiddleware, async (req, res) => {
         for (const path of sourceUserSubmittedPaths) {
           if (path === sourcePrefix || path.startsWith(`${sourcePrefix}/`)) {
             remappedUserSubmittedPaths.push(`${targetPrefix}${path.slice(sourcePrefix.length)}`);
+          }
+        }
+        for (const entry of sourceUserSubmittedMessageFieldPaths) {
+          if (entry.path === sourcePrefix || entry.path.startsWith(`${sourcePrefix}/`)) {
+            remappedUserSubmittedMessageFieldPaths.push({
+              ...entry,
+              path: `${targetPrefix}${entry.path.slice(sourcePrefix.length)}`,
+            });
           }
         }
       }
@@ -289,6 +329,11 @@ router.post('/branch', configMiddleware, async (req, res) => {
       ...(remappedUserSubmittedPaths.length > 0 && {
         userSubmittedPaths: mergeUserSubmittedPaths(remappedUserSubmittedPaths),
       }),
+      ...(remappedUserSubmittedMessageFieldPaths.length > 0 && {
+        userSubmittedMessageFieldPaths: mergeUserSubmittedMessageFieldPaths(
+          remappedUserSubmittedMessageFieldPaths,
+        ),
+      }),
       content: filteredContent,
       unfinished: false,
       error: false,
@@ -297,7 +342,7 @@ router.post('/branch', configMiddleware, async (req, res) => {
 
     let storedMessageForInspection = newMessage;
     let resolvedFiles = [];
-    if (req.config?.filters?.files?.pii != null) {
+    if (hasActiveFilePolicy(req.config?.filters)) {
       const fileInspection = await resolveCanonicalFileReferences({
         filters: req.config.filters,
         input: newMessage,
@@ -473,6 +518,7 @@ router.post('/:conversationId', storedMessageMutationMiddleware, async (req, res
     const message = { ...req.body, conversationId: req.params.conversationId };
     delete message.isUserSubmitted;
     delete message.userSubmittedPaths;
+    delete message.userSubmittedMessageFieldPaths;
     const reqCtx = {
       userId: req?.user?.id,
       isTemporary: req?.body?.isTemporary,
