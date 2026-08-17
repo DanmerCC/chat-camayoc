@@ -2,6 +2,7 @@ const mockCreateRun = jest.fn();
 const mockCaptureAgentCheckpointGeneration = jest.fn();
 const mockDeleteAgentCheckpoint = jest.fn();
 const mockIsHITLEnabled = jest.fn().mockReturnValue(false);
+const mockGetAgentCheckpointer = jest.fn();
 const mockBuildAgentScopedContext = jest.fn((...args) =>
   jest.requireActual('@librechat/api').buildAgentScopedContext(...args),
 );
@@ -15,7 +16,6 @@ const mockFormatAgentMessages = jest.fn(() => ({
 const { Providers } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
 const { GenerationJobManager, createStreamServices } = require('@librechat/api');
-const mockGetAgentCheckpointer = jest.fn();
 const AgentClient = require('./client');
 const { resolveConfigServers } = require('~/server/services/MCP');
 

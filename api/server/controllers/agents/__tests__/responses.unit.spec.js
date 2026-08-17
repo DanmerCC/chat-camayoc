@@ -1313,7 +1313,9 @@ describe('createResponse controller', () => {
     it('preserves the legacy provider error when protection is inactive', async () => {
       const api = require('@librechat/api');
       const rawValue = 'LEGACY-RESPONSES-PROVIDER-ERROR';
-      api.createRun.mockRejectedValueOnce(new Error(rawValue));
+      api.createRun.mockRejectedValueOnce(
+        Object.assign(new Error(rawValue), { code: 'ERR_LEGACY_REMOTE' }),
+      );
 
       await createResponse(req, res);
 
@@ -1322,6 +1324,7 @@ describe('createResponse controller', () => {
         500,
         rawValue,
         'server_error',
+        'ERR_LEGACY_REMOTE',
       );
     });
 
