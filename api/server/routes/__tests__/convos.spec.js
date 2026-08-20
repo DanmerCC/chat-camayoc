@@ -21,7 +21,13 @@ jest.mock('~/server/services/Endpoints/assistants', () => require(MOCKS).assista
 describe('Convos Routes', () => {
   let app;
   let convosRouter;
-  const { deleteToolCalls, deleteConvos, saveConvo } = require('~/models');
+  const {
+    deleteToolCalls,
+    deleteConvos,
+    saveConvo,
+    markConvoSeen,
+    markConvoUnread,
+  } = require('~/models');
   const {
     deleteAgentCheckpoints,
     deleteAllSharedLinksWithCleanup,
@@ -484,6 +490,72 @@ describe('Convos Routes', () => {
         'test-user-123',
         expect.objectContaining({ search: undefined }),
       );
+    });
+  });
+
+  describe('POST /seen', () => {
+    it('records the catch-up for the authenticated user', async () => {
+      markConvoSeen.mockResolvedValue({ modified: true });
+
+      const response = await request(app)
+        .post('/api/convos/seen')
+        .send({ arg: { conversationId: 'conv-seen-1' } });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ modified: true });
+      expect(markConvoSeen).toHaveBeenCalledWith('test-user-123', 'conv-seen-1');
+    });
+
+    it('rejects a missing conversationId without touching the database', async () => {
+      const response = await request(app).post('/api/convos/seen').send({ arg: {} });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'conversationId is required' });
+      expect(markConvoSeen).not.toHaveBeenCalled();
+    });
+
+    it('returns 500 when the database write fails', async () => {
+      markConvoSeen.mockRejectedValue(new Error('db unavailable'));
+
+      const response = await request(app)
+        .post('/api/convos/seen')
+        .send({ arg: { conversationId: 'conv-seen-2' } });
+
+      expect(response.status).toBe(500);
+      expect(response.text).toBe('Error marking conversation seen');
+    });
+  });
+
+  describe('POST /unread', () => {
+    it('flags the conversation unread for the authenticated user', async () => {
+      markConvoUnread.mockResolvedValue({ modified: true });
+
+      const response = await request(app)
+        .post('/api/convos/unread')
+        .send({ arg: { conversationId: 'conv-unread-1' } });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ modified: true });
+      expect(markConvoUnread).toHaveBeenCalledWith('test-user-123', 'conv-unread-1');
+    });
+
+    it('rejects a missing conversationId without touching the database', async () => {
+      const response = await request(app).post('/api/convos/unread').send({ arg: {} });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'conversationId is required' });
+      expect(markConvoUnread).not.toHaveBeenCalled();
+    });
+
+    it('returns 500 when the database write fails', async () => {
+      markConvoUnread.mockRejectedValue(new Error('db unavailable'));
+
+      const response = await request(app)
+        .post('/api/convos/unread')
+        .send({ arg: { conversationId: 'conv-unread-2' } });
+
+      expect(response.status).toBe(500);
+      expect(response.text).toBe('Error marking conversation unread');
     });
   });
 

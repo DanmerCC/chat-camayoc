@@ -8,11 +8,11 @@ import type { TConversation } from 'librechat-data-provider';
 import { useGetStartupConfig, useUpdateConversationMutation } from '~/data-provider';
 import { useNavigateToConvo, useLocalize, useShiftKey } from '~/hooks';
 import ConversationEndpointIcon from './ConversationEndpointIcon';
+import { cn, logger, isConversationUnseen } from '~/utils';
 import { areConversationRenderPropsEqual } from './utils';
 import { NotificationSeverity } from '~/common';
 import { ConvoOptions } from './ConvoOptions';
 import RenameForm from './RenameForm';
-import { cn, logger } from '~/utils';
 import ConvoLink from './ConvoLink';
 import store from '~/store';
 
@@ -42,6 +42,7 @@ function Conversation({
   const { data: startupConfig } = useGetStartupConfig();
   const sharedLinksEnabled = startupConfig?.sharedLinksEnabled === true;
   const isSharedBadgeVisible = conversation.isShared === true && sharedLinksEnabled;
+  const isUnseen = isConversationUnseen(conversation);
   const isShiftHeld = useShiftKey();
   const { conversationId, title = '' } = conversation;
 
@@ -176,6 +177,7 @@ function Conversation({
     retainView,
     renameHandler: handleRename,
     isActiveConvo,
+    isUnseen,
     conversationId,
     chatProjectId: conversation.chatProjectId,
     isPopoverActive,
@@ -221,13 +223,13 @@ function Conversation({
       role="button"
       tabIndex={renaming ? -1 : 0}
       aria-label={
-        isSharedBadgeVisible
+        (isSharedBadgeVisible
           ? localize('com_ui_conversation_label_shared', {
               title: title || localize('com_ui_untitled'),
             })
           : localize('com_ui_conversation_label', {
               title: title || localize('com_ui_untitled'),
-            })
+            })) + (isUnseen ? `, ${localize('com_ui_unseen_reply')}` : '')
       }
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
@@ -275,6 +277,11 @@ function Conversation({
         >
           <ConversationEndpointIcon conversation={conversation} size={20} context="menu-item" />
         </ConvoLink>
+      )}
+      {isUnseen && (
+        /* aria-label above carries the text equivalent: on this role="button" row it
+           overrides subtree content, so an sr-only span here would never be announced. */
+        <span className="mr-1 size-2 shrink-0 rounded-full bg-status-info" aria-hidden="true" />
       )}
       {isSharedBadgeVisible && (
         <Link2 className="icon-sm mr-1 shrink-0 text-text-secondary" aria-hidden="true" />

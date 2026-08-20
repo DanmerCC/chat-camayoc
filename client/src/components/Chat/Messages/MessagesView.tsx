@@ -1,13 +1,19 @@
-import { memo, useState, useRef, useEffect } from 'react';
+import { memo, useState, useRef, useEffect, useCallback } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
 import { Constants } from 'librechat-data-provider';
 import { CSSTransition } from 'react-transition-group';
 import type { TMessage } from 'librechat-data-provider';
-import { useScreenshot, useMessageScrolling, useScrollbarGutter, useLocalize } from '~/hooks';
+import {
+  useLocalize,
+  useScreenshot,
+  useScrollbarGutter,
+  useMessageScrolling,
+  useConversationSeen,
+} from '~/hooks';
+import { MessagesViewProvider, useMessagesSubmission } from '~/Providers';
 import ScrollToBottom from '~/components/Messages/ScrollToBottom';
 import { steerOverlayHeightFamily } from '~/store/steer';
-import { MessagesViewProvider } from '~/Providers';
 import { fontSizeAtom } from '~/store/fontSize';
 import MultiMessage from './MultiMessage';
 import MessageNav from './MessageNav';
@@ -113,6 +119,18 @@ function MessagesViewContent({
   useScrollbarGutter(scrollableRef);
 
   const { conversationId } = conversation ?? {};
+  const { isSubmitting } = useMessagesSubmission();
+
+  /** Piggybacks the messages-end observer rather than adding a second one, and stays a plain
+   *  callback so intersection flips keep re-rendering only `ScrollButton`. */
+  const reportNearBottom = useConversationSeen(conversationId ?? undefined, isSubmitting);
+  const handleNearBottom = useCallback(
+    (isNearBottom: boolean) => {
+      handleNearBottomChange(isNearBottom);
+      reportNearBottom(isNearBottom);
+    },
+    [handleNearBottomChange, reportNearBottom],
+  );
 
   /** The in-flight steer overlay floats above the composer over the bottom of
    *  the thread (see `InFlightSteers`); reserve an equal band here so the
@@ -177,7 +195,7 @@ function MessagesViewContent({
             scrollableRef={scrollableRef}
             messagesEndRef={messagesEndRef}
             scrollHandler={handleSmoothToRef}
-            onNearBottomChange={handleNearBottomChange}
+            onNearBottomChange={handleNearBottom}
             overlayHeight={steerOverlayHeight}
           />
 

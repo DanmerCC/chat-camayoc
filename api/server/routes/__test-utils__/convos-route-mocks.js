@@ -56,6 +56,8 @@ module.exports = {
     getConvo: jest.fn(),
     deleteConvos: jest.fn(),
     saveConvo: jest.fn(),
+    markConvoSeen: jest.fn(),
+    markConvoUnread: jest.fn(),
     deleteAllSharedLinks: jest.fn(),
     deleteConvoSharedLink: jest.fn(),
     deleteToolCalls: jest.fn(),

@@ -267,6 +267,8 @@ async function saveConversation(req, conversationId, agentId, agent) {
       agentId,
       title: agent?.name || 'Open Responses Conversation',
       model: agent?.model,
+      /** Only reached once a response has been generated; drives the unseen-reply indicator. */
+      ...(req?.body?.isTemporary !== true && { lastResponseAt: new Date() }),
     },
     { context: 'Responses API - save conversation' },
   );

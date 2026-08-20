@@ -65,6 +65,9 @@ export interface ConversationMethods {
     conversationId: string,
   ): Promise<Pick<IConversation, 'expiredAt'> | null>;
   getConvoTitle(user: string, conversationId: string): Promise<string | null>;
+  markConvoSeen(user: string, conversationId: string): Promise<{ modified: boolean }>;
+  markConvoUnread(user: string, conversationId: string): Promise<{ modified: boolean }>;
+  stampConvoLastResponse(user: string, conversationId: string): Promise<void>;
   deleteConvos(
     user: string,
     filter: FilterQuery<IConversation>,
@@ -716,7 +719,7 @@ export function createConversationMethods(
 
       const convos = await Conversation.find(query)
         .select(
-          'conversationId endpoint title createdAt updatedAt user model agent_id assistant_id spec iconURL chatProjectId pinned',
+          'conversationId endpoint title createdAt updatedAt user model agent_id assistant_id spec iconURL chatProjectId pinned lastResponseAt lastSeenAt',
         )
         .sort(sortObj)
         .limit(limit + 1)
@@ -921,6 +924,78 @@ export function createConversationMethods(
     }
   }
 
+  /**
+   * Records that the user has caught up with a conversation's newest message.
+   *
+   * Deliberately bypasses `saveConvo`: this needs neither the message lookup nor the upsert,
+   * and `timestamps: false` keeps `updatedAt` untouched so reading a conversation does not
+   * reorder the sidebar.
+   */
+  async function markConvoSeen(user: string, conversationId: string) {
+    try {
+      const Conversation = mongoose.models.Conversation as Model<IConversation>;
+      const result = await Conversation.updateOne(
+        { conversationId, user },
+        { $set: { lastSeenAt: new Date() } },
+        { timestamps: false },
+      );
+      return { modified: result.modifiedCount > 0 };
+    } catch (error) {
+      logger.error('[markConvoSeen] Error marking conversation seen', error);
+      throw new Error('Error marking conversation seen');
+    }
+  }
+
+  /**
+   * Flags a conversation as unread again: the user explicitly wants the indicator back.
+   *
+   * One atomic pipeline update rather than a read-then-write: `$$REMOVE` clears the
+   * catch-up so `lastSeenAt < lastResponseAt` holds again, and a conversation with no
+   * reply yet gets `lastResponseAt` stamped so the flag itself lights the dot.
+   * `timestamps: false` keeps flagging from reordering the sidebar.
+   */
+  async function markConvoUnread(user: string, conversationId: string) {
+    try {
+      const Conversation = mongoose.models.Conversation as Model<IConversation>;
+      const result = await Conversation.updateOne(
+        { conversationId, user },
+        [
+          {
+            $set: {
+              lastSeenAt: '$$REMOVE',
+              lastResponseAt: { $ifNull: ['$lastResponseAt', new Date()] },
+            },
+          },
+        ],
+        { timestamps: false },
+      );
+      return { modified: result.modifiedCount > 0 };
+    } catch (error) {
+      logger.error('[markConvoUnread] Error marking conversation unread', error);
+      throw new Error('Error marking conversation unread');
+    }
+  }
+
+  /**
+   * Stamps a persisted assistant reply for paths that save the message directly
+   * (assistants threads, resumed runs, terminal abort re-saves) rather than through
+   * BaseClient's saveConvo payload. Idempotent, and leaves `updatedAt` alone so the
+   * stamp alone never reorders the sidebar.
+   */
+  async function stampConvoLastResponse(user: string, conversationId: string) {
+    try {
+      const Conversation = mongoose.models.Conversation as Model<IConversation>;
+      await Conversation.updateOne(
+        { conversationId, user },
+        { $set: { lastResponseAt: new Date() } },
+        { timestamps: false },
+      );
+    } catch (error) {
+      logger.error('[stampConvoLastResponse] Error stamping conversation reply', error);
+      throw new Error('Error stamping conversation reply');
+    }
+  }
+
   return {
     getConvoFiles,
     searchConversation,
@@ -932,6 +1007,9 @@ export function createConversationMethods(
     getConvo,
     getConvoRetention,
     getConvoTitle,
+    markConvoSeen,
+    markConvoUnread,
+    stampConvoLastResponse,
     deleteConvos,
   };
 }

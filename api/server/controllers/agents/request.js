@@ -33,7 +33,7 @@ const {
   cleanupMCPRequestContextForReq,
 } = require('~/server/services/MCPRequestContext');
 const { logViolation } = require('~/cache');
-const { saveMessage, getMessages, getConvo } = require('~/models');
+const { saveMessage, getMessages, getConvo, stampConvoLastResponse } = require('~/models');
 const {
   GENERATION_PROTOCOL_HEADER,
   GENERATION_PROTOCOL_V2,
@@ -1612,6 +1612,15 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               ? 'Terminal response could not be persisted as unfinished'
               : 'Response message could not be persisted before terminal publication',
           );
+        }
+
+        /* Stopped turns that win the terminal CAS persist here without BaseClient's
+           saveConvo payload, which is what normally stamps the unseen-reply indicator.
+           Best-effort: a missed stamp must not fail the final publication. */
+        if (reqCtx.isTemporary !== true) {
+          await stampConvoLastResponse(reqCtx.userId, response.conversationId).catch((error) => {
+            logger.warn('[AgentController] Failed to stamp lastResponseAt', error);
+          });
         }
 
         // If the user stopped this turn — or an empty preempt boundary truncated

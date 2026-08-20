@@ -52,6 +52,12 @@ const convoSchema: Schema<IConversation> = new Schema(
     pinned: {
       type: Boolean,
     },
+    lastResponseAt: {
+      type: Date,
+    },
+    lastSeenAt: {
+      type: Date,
+    },
   },
   { timestamps: true },
 );

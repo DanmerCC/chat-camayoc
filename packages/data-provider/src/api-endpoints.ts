@@ -122,6 +122,8 @@ export const updateConversation = () => `${conversationsRoot}/update`;
 
 export const archiveConversation = () => `${conversationsRoot}/archive`;
 export const pinConversation = () => `${conversationsRoot}/pin`;
+export const markConversationSeen = () => `${conversationsRoot}/seen`;
+export const markConversationUnread = () => `${conversationsRoot}/unread`;
 
 export const deleteConversation = () => `${conversationsRoot}`;
 
